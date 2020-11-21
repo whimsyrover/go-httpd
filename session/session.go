@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/rsms/go-uuid"
 	"github.com/rsms/go-httpd/util"
+	"github.com/rsms/go-uuid"
 )
 
 // Session holds a set of keys & values associated with an ID

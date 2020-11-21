@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,12 +19,14 @@ import (
 )
 
 type Server struct {
-	Gotalk   *gotalk.WebSocketServer
 	Logger   *log.Logger   // defaults to log.RootLogger
 	PubDir   string        // directory to serve files from. File serving is disabled if empty.
-	Routes   http.ServeMux // http request routes
+	Routes   Router        // http request routes
 	Server   http.Server   // underlying http server
 	Sessions session.Store // Call Sessions.SetStorage(s) to enable sessions
+
+	Gotalk     *gotalk.WebSocketServer // set to nil to disable gotalk
+	GotalkPath string                  // defaults to "/gotalk/"
 
 	fileHandler http.Handler // serves pubdir (nil if len(PubDir)==0)
 
@@ -36,25 +40,24 @@ type Server struct {
 func NewServer(pubDir, addr string) *Server {
 	s := &Server{
 		PubDir: pubDir,
-		Gotalk: gotalk.WebSocketHandler(),
 		Logger: log.RootLogger,
-
 		Server: http.Server{
 			Addr:           addr,
 			WriteTimeout:   10 * time.Second,
 			ReadTimeout:    10 * time.Second,
 			MaxHeaderBytes: 1 << 20, // 1MB
 		},
+		Gotalk:     gotalk.WebSocketHandler(),
+		GotalkPath: "/gotalk/",
 	}
 
 	if len(pubDir) > 0 {
 		s.fileHandler = http.FileServer(http.Dir(pubDir))
 	}
 
-	s.Server.Handler = &s.Routes
+	s.Server.Handler = s
 	s.Gotalk.Handlers = gotalk.NewHandlers()
 	s.Server.RegisterOnShutdown(func() {
-		s.logi("s.Server.RegisterOnShutdown")
 		// close all connected sockets
 		s.gotalkSocksMu.RLock()
 		defer s.gotalkSocksMu.RUnlock()
@@ -63,69 +66,135 @@ func NewServer(pubDir, addr string) *Server {
 		}
 	})
 
-	// XXX DEBUG HTTP routes
-	// s.Routes.HandleFunc("/hello", func(w http.ResponseWriter, req *http.Request) {
-	// 	// // The "/" pattern matches everything, so we need to check
-	// 	// // that we're at the root here.
-	// 	// if req.URL.Path != "/hello" {
-	// 	// 	http.NotFound(w, req)
-	// 	// 	return
-	// 	// }
-	// 	fmt.Fprintf(w, "Welcome to the home page!")
-	// })
-
-	s.Routes.Handle("/gotalk/", s.Gotalk)
-	// Note: a s.Gotalk.OnAccept handler is installed in prepareToServe
-
-	// XXX DEBUG some test handlers
-	s.GotalkRoute("ping", func(c *gotalk.Sock) (string, error) {
-		return "pong", nil
-	})
-	s.GotalkRoute("test/message", func(c *gotalk.Sock, message string) (string, error) {
-		return "pong: " + message, nil
-	})
-
 	return s
+}
+
+// ServeHTTP serves a HTTP request using this server
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.RequestURI == "*" {
+		if r.ProtoAtLeast(1, 1) {
+			w.Header().Set("Connection", "close")
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// CONNECT requests are not canonicalized
+	if r.Method != "CONNECT" {
+		// strip port and clean path
+		url := *r.URL
+		path := cleanPath(r.URL.Path)
+
+		// redirect if the path was not canonical
+		if path != r.URL.Path {
+			url.Path = path
+			http.Redirect(w, r, url.String(), http.StatusMovedPermanently)
+			return
+		}
+
+		// set cleaned valued
+		url.Path = path
+		r.Host = stripHostPort(r.Host)
+	}
+
+	// gotalk?
+	if s.Gotalk != nil && s.GotalkPath != "" && strings.HasPrefix(r.URL.Path, s.GotalkPath) {
+		// Note: s.Gotalk.OnAccept handler is installed in prepareToServe
+		s.Gotalk.ServeHTTP(w, r)
+		return
+	}
+
+	// create a new transaction
+	t := NewTransaction(s, w, r)
+
+	// recover panic and turn it into an error
+	defer func() {
+		if err := recover(); err != nil {
+			s.LogError("ServeHTTP error: %v", err)
+			if s.Logger.Level <= log.LevelDebug {
+				s.LogDebug("ServeHTTP error: %s\n%s", err, string(debug.Stack()))
+			}
+			t.RespondWithMessage(500, err)
+		}
+	}()
+
+	// serve
+	if s.Routes.MaybeServeHTTP(t) {
+		return
+	}
+
+	// fallback to serving files, if configured
+	if s.fileHandler != nil {
+		s.fileHandler.ServeHTTP(w, r)
+		return
+	}
+
+	// 404 not found
+	t.RespondWithStatusNotFound()
+}
+
+// cleanPath returns the canonical path for p, eliminating . and .. elements.
+func cleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	np := path.Clean(p)
+	// path.Clean removes trailing slash except for root;
+	// put the trailing slash back if necessary.
+	if p[len(p)-1] == '/' && np != "/" {
+		// Fast path for common case of p being the string we want:
+		if len(p) == len(np)+1 && strings.HasPrefix(p, np) {
+			np = p
+		} else {
+			np += "/"
+		}
+	}
+	return np
+}
+
+// stripHostPort returns h without any trailing ":<port>".
+func stripHostPort(h string) string {
+	// If no port on host, return unchanged
+	if strings.IndexByte(h, ':') == -1 {
+		return h
+	}
+	host, _, err := net.SplitHostPort(h)
+	if err != nil {
+		return h // on error, return unchanged
+	}
+	return host
 }
 
 // -----------------------------------------------------------------------------------------------
 // routes
 
-// Route registers a HTTP request handler for the given pattern.
-//
-// Patterns name fixed, rooted paths, like "/favicon.ico", or rooted subtrees, like
-// "/images/" (note the trailing slash). Longer patterns take precedence over
-// shorter ones, so that if there are handlers registered for both "/images/" and
-// "/images/thumbnails/", the latter handler will be called for paths beginning
-// "/images/thumbnails/" and the former will receive requests for any other paths
-// in the "/images/" subtree.
-//
-// Note that since a pattern ending in a slash names a rooted subtree, the pattern
-// "/" matches all paths not matched by other registered patterns, not just the URL
-// with Path == "/".
-//
-// If a subtree has been registered and a request is received naming the subtree
-// root without its trailing slash, ServeMux redirects that request to the subtree
-// root (adding the trailing slash). This behavior can be overridden with a
-// separate registration for the path without the trailing slash. For example,
-// registering "/images/" causes ServeMux to redirect a request for "/images" to
-// "/images/", unless "/images" has been registered separately.
-//
-// Patterns may optionally begin with a host name, restricting matches to URLs on
-// that host only. Host-specific patterns take precedence over general patterns, so
-// that a handler might register for the two patterns "/codesearch" and
-// "codesearch.google.com/" without also taking over requests for
-// "http://www.google.com/".
-//
-// ServeMux also takes care of sanitizing the URL request path and the Host header,
-// stripping the port number and redirecting any request containing . or ..
-// elements or repeated slashes to an equivalent, cleaner URL.
-//
-func (s *Server) Route(pattern string, handler func(*Transaction)) {
-	s.Routes.HandleFunc(pattern, s.createHttpRouteHandler(handler))
+// Handler responds to a HTTP request
+type Handler interface {
+	ServeHTTP(*Transaction)
 }
 
-// GotalkRoute registers a Gotalk request handler for the given operation,
+// Handle registers a HTTP request handler for the given pattern.
+//
+// The server takes care of sanitizing the URL request path and the Host header,
+// stripping the port number and redirecting any request containing . or ..
+// elements or repeated slashes to an equivalent, cleaner URL.
+func (s *Server) Handle(pattern string, handler Handler) {
+	s.Routes.Handle(pattern, handler)
+}
+
+// HandleFunc registers a HTTP request handler function for the given pattern.
+//
+// The server takes care of sanitizing the URL request path and the Host header,
+// stripping the port number and redirecting any request containing . or ..
+// elements or repeated slashes to an equivalent, cleaner URL.
+func (s *Server) HandleFunc(pattern string, handler func(*Transaction)) {
+	s.Routes.HandleFunc(pattern, handler)
+}
+
+// HandleGotalk registers a Gotalk request handler for the given operation,
 // with automatic JSON encoding of values.
 //
 // `handler` must conform to one of the following signatures:
@@ -143,31 +212,20 @@ func (s *Server) Route(pattern string, handler func(*Transaction)) {
 //   func() error
 //
 // If `op` is empty, handle all requests which doesn't have a specific handler registered.
-func (s *Server) GotalkRoute(op string, handler interface{}) {
+func (s *Server) HandleGotalk(op string, handler interface{}) {
 	s.Gotalk.Handlers.Handle(op, handler)
 }
 
-func (s *Server) createHttpRouteHandler(f func(*Transaction)) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		t := NewTransaction(s, w, r)
-
-		// recover panic and turn it into an error
-		defer func() {
-			if err := recover(); err != nil {
-				var tail string
-				if DevMode {
-					tail = "\n" + string(debug.Stack())
-				}
-				s.loge("error in http handler: %v%s", err, tail)
-				t.RespondWithMessage(500, err)
-			}
-		}()
-
-		f(t)
-	}
-}
-
 // -----------------------------------------------------------------------------------------------
+
+// protoname should be "http" or "https"
+func (s *Server) bindListener(protoname string) (net.Listener, error) {
+	addr := s.Server.Addr
+	if addr == "" {
+		addr = ":" + protoname
+	}
+	return net.Listen("tcp", addr)
+}
 
 func (s *Server) prepareToServe() {
 	// Configure logger
@@ -182,29 +240,37 @@ func (s *Server) prepareToServe() {
 		s.Server.ErrorLog = s.Logger.GoLogger(log.LevelError)
 	}
 
-	// Unless there's already a handler registered for "/", install a "catch all" file handler.
-	// s.fileHandler is nil if PubDir is empty.
-	if s.fileHandler != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// ignore error "http: multiple registrations for /"
-				}
-			}()
-			s.Routes.Handle("/", s.fileHandler)
-		}()
-	}
+	// // Unless there's already a handler registered for "/", install a "catch all" file handler.
+	// // s.fileHandler is nil if PubDir is empty.
+	// if s.fileHandler != nil {
+	// 	func() {
+	// 		defer func() {
+	// 			if r := recover(); r != nil {
+	// 				// ignore error "http: multiple registrations for /"
+	// 			}
+	// 		}()
+	// 		s.Routes.Handle("/", s.fileHandler)
+	// 	}()
+	// }
 
-	// Install the gotalk connect handler here rather than when creating the Server struct so that
-	// in case the user installed a handler, we can wrap it.
-	s.gotalkOnConnectUser = s.Gotalk.OnConnect // save any user handler
-	s.Gotalk.OnConnect = s.gotalkOnConnect
+	if s.Gotalk != nil {
+		// Install the gotalk connect handler here rather than when creating the Server struct so that
+		// in case the user installed a handler, we can wrap it.
+		s.gotalkOnConnectUser = s.Gotalk.OnConnect // save any user handler
+		s.Gotalk.OnConnect = s.gotalkOnConnect
+	}
+}
+
+func (s *Server) justBeforeServing(ln net.Listener, protoname, extraLogMsg string) {
+	s.LogInfo("listening on %s://%s (pubdir %q%s)", protoname, ln.Addr(), s.PubDir, extraLogMsg)
 }
 
 func (s *Server) returnFromServe(err error) error {
-	// Restore previously replaced Gotalk.OnConnect
-	s.Gotalk.OnConnect = s.gotalkOnConnectUser
-	s.gotalkOnConnectUser = nil
+	if s.Gotalk != nil {
+		// Restore previously replaced Gotalk.OnConnect
+		s.Gotalk.OnConnect = s.gotalkOnConnectUser
+		s.gotalkOnConnectUser = nil
+	}
 
 	if err == http.ErrServerClosed {
 		// returned from Serve functions when server.Shutdown() was initiated
@@ -214,7 +280,7 @@ func (s *Server) returnFromServe(err error) error {
 }
 
 func (s *Server) gotalkOnConnect(sock *gotalk.WebSocket) {
-	s.logd("gotalk sock#%p connected", sock)
+	s.LogDebug("gotalk sock#%p connected", sock)
 
 	// call user handler
 	if s.gotalkOnConnectUser != nil {
@@ -227,10 +293,10 @@ func (s *Server) gotalkOnConnect(sock *gotalk.WebSocket) {
 	// register close handler
 	userCloseHandler := sock.CloseHandler
 	sock.CloseHandler = func(sock *gotalk.WebSocket, closeCode int) {
-		s.logd("gotalk sock#%p disconnected", sock)
+		s.LogDebug("gotalk sock#%p disconnected", sock)
 		s.gotalkSocksMu.Lock()
-		defer s.gotalkSocksMu.Unlock()
 		delete(s.gotalkSocks, sock)
+		s.gotalkSocksMu.Unlock()
 		sock.CloseHandler = nil
 		if userCloseHandler != nil {
 			userCloseHandler(sock, closeCode)
@@ -246,9 +312,10 @@ func (s *Server) gotalkOnConnect(sock *gotalk.WebSocket) {
 	s.gotalkSocksMu.Unlock()
 }
 
-func (s *Server) Serve(l net.Listener) error {
+func (s *Server) Serve(ln net.Listener) error {
 	s.prepareToServe()
-	return s.Server.Serve(l)
+	s.justBeforeServing(ln, "http", "")
+	return s.Server.Serve(ln)
 }
 
 func (s *Server) Addr() string {
@@ -272,16 +339,16 @@ func (s *Server) Shutdown(ctx context.Context, stoppedAcceptingCallback func()) 
 // logging
 //
 
-func (s *Server) loge(format string, v ...interface{}) {
+func (s *Server) LogError(format string, v ...interface{}) {
 	s.Logger.Error(format, v...)
 }
-func (s *Server) logw(format string, v ...interface{}) {
+func (s *Server) LogWarn(format string, v ...interface{}) {
 	s.Logger.Warn(format, v...)
 }
-func (s *Server) logi(format string, v ...interface{}) {
+func (s *Server) LogInfo(format string, v ...interface{}) {
 	s.Logger.Info(format, v...)
 }
-func (s *Server) logd(format string, v ...interface{}) {
+func (s *Server) LogDebug(format string, v ...interface{}) {
 	s.Logger.LogDebug(1, format, v...)
 }
 
@@ -375,81 +442,3 @@ func gracefulShutdownAll() {
 	gracefulShutdownChan = nil
 	gracefulShutdownServers = nil
 }
-
-//
-//
-// ----------------------------------------
-//
-//
-
-// gotalk.Handle("users.list", func(c *gotalk.Sock) ([]*User, error) {
-//   keyPrefix := []byte("user:")
-//   it := s.db.NewIterator(util.BytesPrefix(keyPrefix), nil)
-//   defer it.Release()
-//   var users []*User
-//   for it.Next() {
-//     // logf("username: %s", string(it.Key()[len(keyPrefix):]))
-//     u := decodeUser(it.Value())
-//     if u != nil {
-//       users = append(users, u)
-//     }
-//   }
-//   return users, it.Error()
-// })
-
-// gotalk.Handle("profile.save", func(c *gotalk.Sock, info User) error {
-//   u := s.userLoadFromGotalk(c)
-//   u.AboutURL = info.AboutURL
-//   u.AboutText = info.AboutText
-//   err := u.store(s.db)
-//   if err != nil {
-//     logf("[profile.save] failed to store user: %s", err.Error())
-//   } else {
-//     s.Broadcast("user-change", u)
-//   }
-//   return err
-// })
-
-/*func (s *Server) gotalkOnConnect(sock *gotalk.Sock) {
-  ws, ok := sock.Conn().(*websocket.Conn)
-  if !ok {
-    err := fmt.Errorf("gotalk socket not connected over websocket")
-    logf("[gotalk#%p] error %v", sock, err)
-    sock.Notify("error", fmt.Sprintf("%v", err))
-    sock.Close()
-    return
-  }
-
-  se := s.sessions.GetHTTP(ws.Request())
-  user := userLoadFromSession(ws.Request().Context(), s.db, se)
-
-  if user == nil {
-    // not signed in
-    logf("[gotalk#%p] open. user=anonymous", sock)
-    if DEV_BUILD {
-      sock.CloseHandler = func(sock *gotalk.Sock, _ int) {
-        logf("[gotalk#%p] close", sock)
-      }
-    }
-  } else {
-    logf("[gotalk#%p] open. user=#%d", sock, user.Id)
-
-    // Register connection
-    s.socksmu.Lock()
-    s.socks[sock] = 1
-    s.socksmu.Unlock()
-
-    // Unregister when connection closes
-    sock.CloseHandler = func(sock *gotalk.Sock, _ int) {
-      logf("[gotalk#%p] close", sock)
-      s.socksmu.Lock()
-      defer s.socksmu.Unlock()
-      delete(s.socks, sock)
-    }
-
-    sock.UserData = user.Id
-  }
-
-  // notifcy client about the current viewer (even if its nil, so the client knows)
-  sock.Notify("viewer", user)
-}*/
