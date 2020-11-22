@@ -140,6 +140,26 @@ func (t *Transaction) Form() url.Values {
 	return t.Request.PostForm
 }
 
+func (t *Transaction) AuxVar(name string) interface{} {
+	return t.AuxData[name]
+}
+
+func (t *Transaction) SetAuxVar(name string, value interface{}) {
+	if t.AuxData == nil {
+		t.AuxData = make(map[string]interface{})
+	}
+	t.AuxData[name] = value
+}
+
+// RoutePath returns the request URL path relative to the Router that dispatched this request.
+// If the dispatch was done by t.Server.Router then this is identical to t.URL.Path.
+func (t *Transaction) RoutePath() string {
+	if t.routeMatch != nil {
+		return t.routeMatch.Path
+	}
+	return t.URL.Path
+}
+
 // --------------------------------------------------------------------------------------
 // Responding
 
@@ -342,31 +362,76 @@ func (t *Transaction) RespondWithStatusLoopDetected()                  { t.rws(5
 func (t *Transaction) RespondWithStatusNotExtended()                   { t.rws(510) }
 func (t *Transaction) RespondWithStatusNetworkAuthenticationRequired() { t.rws(511) }
 
-// Redirect sends a redirection response (HTTP 302 "Found")
-func (t *Transaction) Redirect(url string) {
-	http.Redirect(t, t.Request, url, http.StatusFound)
+// Redirect sends a redirection response by setting the "location" header field.
+// The url may be a path relative to the request path.
+//
+// If the Content-Type header has not been set, Redirect sets it to "text/html; charset=utf-8"
+// and writes a small HTML body. Setting the Content-Type header to any value, including nil,
+// disables that behavior.
+func (t *Transaction) Redirect(url string, code int) {
+	http.Redirect(t, t.Request, url, code)
 }
 
-// RedirectToReferrer redirects the request to the referrer or if no referrer is set, or the
-// referrer is the current URL, redirects to fallbackUrl.
-func (t *Transaction) RedirectToReferrer(fallbackUrl string) {
-	referrer := t.DifferentReferrerURL()
-	if referrer != nil {
-		t.Redirect(referrer.String())
-	} else {
-		t.Redirect(fallbackUrl)
+// TemporaryRedirect sends a redirection response HTTP 302.
+// The user agent may change method (usually it uses GET) but it's ambiguous.
+func (t *Transaction) TemporaryRedirect(url string) {
+	t.Redirect(url, http.StatusFound)
+}
+
+// TemporaryRedirectGET sends a redirection response HTTP 303.
+// The new location will be requested using the GET method.
+func (t *Transaction) TemporaryRedirectGET(url string) {
+	code := http.StatusFound
+	if t.Request.ProtoAtLeast(1, 1) {
+		code = http.StatusSeeOther
 	}
+	t.Redirect(url, code)
 }
 
-// DifferentReferrer returns a URL of the "referer" request field if present.
-// If the referrer's path is the same as t.URL.Path then nil is returned.
-func (t *Transaction) DifferentReferrerURL() *url.URL {
+// TemporaryRedirectSameMethod sends a redirection response HTTP 307.
+// The new location will be requested using the same method as the current request.
+func (t *Transaction) TemporaryRedirectSameMethod(url string) {
+	code := http.StatusFound
+	if t.Request.ProtoAtLeast(1, 1) {
+		code = http.StatusTemporaryRedirect
+	}
+	t.Redirect(url, code)
+}
+
+// PermanentRedirect sends a redirection response HTTP 301.
+func (t *Transaction) PermanentRedirect(url string) {
+	t.Redirect(url, http.StatusMovedPermanently)
+}
+
+// PermanentRedirectSameMethod sends a redirection response HTTP 308.
+// The new location will be requested using the same method as the current request.
+func (t *Transaction) PermanentRedirectSameMethod(url string) {
+	code := http.StatusMovedPermanently
+	if t.Request.ProtoAtLeast(1, 1) {
+		code = http.StatusPermanentRedirect
+	}
+	t.Redirect(url, code)
+}
+
+// ReferrerURL returns a URL of the "referer" request field if present.
+// Returns fallback if the value of the "referer" header is not a valid URL.
+func (t *Transaction) ReferrerURL(fallback *url.URL) *url.URL {
 	referrer := t.Request.Header.Get("referer") // yup, it's misspelled
 	if referrer != "" {
 		refurl, err := url.Parse(referrer)
-		if err == nil && refurl.Path != t.URL.Path {
+		if err == nil {
 			return refurl
 		}
+	}
+	return fallback
+}
+
+// DifferentReferrerURL returns a URL of the "referer" request field if present.
+// If the referrer's path is the same as t.URL.Path then nil is returned.
+func (t *Transaction) DifferentReferrerURL() *url.URL {
+	referrer := t.ReferrerURL(nil)
+	if referrer != nil && referrer.Path != t.URL.Path {
+		return referrer
 	}
 	return nil
 }

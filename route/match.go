@@ -2,6 +2,7 @@ package route
 
 type Match struct {
 	*Route
+	Path   string   // relative to router's BasePath
 	values []string // variable values
 }
 

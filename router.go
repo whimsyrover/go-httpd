@@ -4,14 +4,14 @@ import (
 	"github.com/rsms/go-httpd/route"
 )
 
+type handlerFunc func(*Transaction)
+
+func (f handlerFunc) ServeHTTP(t *Transaction) { f(t) }
+
 // Router is a HTTP-specific kind of route.Router
 type Router struct {
 	route.Router
 }
-
-type handlerFunc func(*Transaction)
-
-func (f handlerFunc) ServeHTTP(t *Transaction) { f(t) }
 
 func (r *Router) HandleFunc(pattern string, f func(*Transaction)) (*route.Route, error) {
 	return r.Handle(pattern, handlerFunc(f))

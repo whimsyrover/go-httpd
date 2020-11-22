@@ -74,13 +74,13 @@ func (r *Router) Match(conditions CondFlags, path string) (*Match, error) {
 		if route.Pattern == nil {
 			// no variables
 			if route.IsPrefix || path == route.EntryPrefix {
-				return &Match{Route: route}, nil
+				return &Match{Route: route, Path: path}, nil
 			}
 		} else {
 			// check regexp
 			values := route.Pattern.FindStringSubmatch(path)
 			if len(values) == 1+len(route.Vars) {
-				return &Match{Route: route, values: values[1:]}, nil
+				return &Match{Route: route, Path: path, values: values[1:]}, nil
 			}
 		}
 	}
