@@ -316,7 +316,7 @@ func (s *Server) gotalkOnConnect(sock *gotalk.WebSocket) {
 // Gotalk socket acceptance will be blocked while this method is called as the underlying
 // socket list is locked during the call.
 // If f returns false then iteration stops early.
-func (s *Server) RangeGotalkSockets(f func(*gotalk.WebSocket)bool) {
+func (s *Server) RangeGotalkSockets(f func(*gotalk.WebSocket) bool) {
 	s.gotalkSocksMu.RLock()
 	defer s.gotalkSocksMu.RUnlock()
 	for s := range s.gotalkSocks {
