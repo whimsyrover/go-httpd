@@ -40,4 +40,16 @@ func (r *Router) ServeHTTP(t *Transaction) {
 	}
 }
 
-
+func (r *Router) MaybeServeHTTP(t *Transaction) bool {
+	route, err := r.Match(t)
+	if err != nil {
+		t.Server.LogError("Router configuration error: %v", err)
+		t.RespondWithStatusInternalServerError()
+		return true
+	}
+	if route == nil {
+		return false
+	}
+	route.ServeHTTP(t)
+	return true
+}
